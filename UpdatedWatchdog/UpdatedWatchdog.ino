@@ -36,8 +36,7 @@
 #define ECHO_LAG_LIMIT 5
 // The speed a motor can be at during an E-Stop before a Cat 0 Stop is thrown
 #define ESTOP_MOTOR_MOVE_THRESHOLD 5
-// The max speed a motor can be at during any point in operation of the ride
-#define MAX_MOTOR_SPEED 9500
+#define MAX_MOTOR_SPEED 9500  // QPPS; triggers FAULT_MOTION if exceeded
 
 
 // -- PLC State Machine --------------------------------------------------------
@@ -83,7 +82,7 @@ static uint16_t      plcCounter        = 0;
 static unsigned long lastValidPacketMs = 0;
 static unsigned long estopAssertedMs   = 0;
 static bool          rccHealthy        = false;
-static uint8_t       latchedFaults     = 0;  // Latched at ESTOP entry; held until recovery
+static bool          badCrcFlag        = false; // Set on CRC failure; cleared on good packet
 static RccPacket     rcc               = {}; // Most recent valid RCC packet
 
 // -- CRC16 — ANSI, poly 0x8005 ------------------------------------------------
@@ -180,16 +179,16 @@ static void updateLed(unsigned long now) {
 //
 // Status bits — reflect current PLC state (live each cycle):
 #define STATUS_ESTOP_RELEASED   0x01  // PLC E-stop gate open (not asserting)
-#define STATUS_PLC_OK           0x02  // All safety checks passing
+#define STATUS_PLC_OK           0x02  // No active faults; in ESTOP this means safe to attempt reset
 //
-// Fault bits — latched at ESTOP entry, cleared on recovery.
+// Fault bits — active conditions only, computed live each cycle.
 // Multiple faults are OR'd together:
 #define FAULT_WATCHDOG          0x04  // RCC packets stopped
 #define FAULT_LIMIT_MISMATCH    0x08  // PLC and RCC limit switch readings disagree
-// bit 4 reserved
+#define FAULT_BAD_CRC           0x10  // RCC packet received but CRC failed
 #define FAULT_LEVEL0            0x20  // Relay cut — recoverable by key cycle to OFF
 #define FAULT_ECHO_COUNTER      0x40  // RCC not mirroring PLC counter
-#define FAULT_OVERSPEED         0x80  // Motor speed exceeded envelope during normal operation
+#define FAULT_MOTION            0x80  // Motion envelope violation (overspeed; position/accel checks TBD)
 
 // -- Safety Checks ------------------------------------------------------------
 static bool motorsMoving() {
@@ -198,14 +197,14 @@ static bool motorsMoving() {
 
 // Returns a bitmask of all active fault bits, or 0 if all checks pass.
 // Shared by safetyViolation() and enterEstop() to avoid duplicating logic.
-// TODO: add position/acceleration envelope checks once thresholds are defined.
+// TODO: add position/acceleration envelope checks once thresholds are defined; set FAULT_MOTION.
 // TODO: confirm limit switch bit ordering matches RCC packet offset 66 before re-enabling.
 static uint8_t checkSafetyFaults(uint8_t plcLimits) {
   uint8_t faults = 0;
   if (plcLimits != rcc.limitSwitches)                                                                                                           faults |= FAULT_LIMIT_MISMATCH;
   int16_t echoLag = (int16_t)((plcCounter - 1) - rcc.echoOfPlc);
   if (echoLag < 0 || echoLag > ECHO_LAG_LIMIT)                                                                                                faults |= FAULT_ECHO_COUNTER;
-  if (abs(rcc.m1Speed) > MAX_MOTOR_SPEED || abs(rcc.m2Speed) > MAX_MOTOR_SPEED)                                                                faults |= FAULT_OVERSPEED;
+  if (abs(rcc.m1Speed) > MAX_MOTOR_SPEED || abs(rcc.m2Speed) > MAX_MOTOR_SPEED)                                                                faults |= FAULT_MOTION;
   return faults;
 }
 
@@ -213,21 +212,29 @@ static bool safetyViolation(uint8_t plcLimits) {
   return checkSafetyFaults(plcLimits) != 0;
 }
 
-// Transitions into STATE_ESTOP, latching the triggering fault bits for diagnostics.
-static void enterEstop(unsigned long now, uint8_t plcLimits) {
+// Transitions into STATE_ESTOP.
+static void enterEstop(unsigned long now) {
   estopAssertedMs = now;
-  latchedFaults   = checkSafetyFaults(plcLimits);
-  if (!rccHealthy) latchedFaults |= FAULT_WATCHDOG;
   plcState = STATE_ESTOP;
 }
 
-static uint8_t buildStatusByte() {
+static uint8_t buildStatusByte(uint8_t plcLimits) {
   switch (plcState) {
     case STATE_OK:
-    case STATE_MAINT:  return STATUS_ESTOP_RELEASED | STATUS_PLC_OK;
-    case STATE_ESTOP:  return latchedFaults;
-    case STATE_FAULT:  return latchedFaults | FAULT_LEVEL0;
-    default:           return 0;
+    case STATE_MAINT:
+      return STATUS_ESTOP_RELEASED | STATUS_PLC_OK;
+    case STATE_ESTOP: {
+      uint8_t faults = checkSafetyFaults(plcLimits);
+      if (!rccHealthy) faults |= FAULT_WATCHDOG;
+      if (badCrcFlag)  faults |= FAULT_BAD_CRC;
+      // No active faults — signal to RCC that reset is safe to attempt
+      if (faults == 0) return STATUS_PLC_OK;
+      return faults;
+    }
+    case STATE_FAULT:
+      return FAULT_LEVEL0;
+    default:
+      return 0;
   }
 }
 
@@ -265,9 +272,14 @@ void loop() {
     if (millis() - waitStart > WATCHDOG_MS) break;
   }
   now = millis();
-  if (rxLen == RCC_PACKET_SIZE && parseRccPacket(rxBuf)) {
-    lastValidPacketMs = now;
-    rccHealthy = true;
+  if (rxLen == RCC_PACKET_SIZE) {
+    if (parseRccPacket(rxBuf)) {
+      lastValidPacketMs = now;
+      rccHealthy = true;
+      badCrcFlag = false;
+    } else {
+      badCrcFlag = true;
+    }
   }
 
   uint8_t plcLimits = readLimitSwitches();
@@ -295,7 +307,7 @@ void loop() {
 
     case STATE_OK:
       if (!keyOn) { plcState = STATE_OFF; break; }
-      if (!rccHealthy || safetyViolation(plcLimits)) { enterEstop(now, plcLimits); break; }
+      if (!rccHealthy || safetyViolation(plcLimits)) { enterEstop(now); break; }
       setEstop(false);  // All checks pass — open PLC E-stop gate
       break;
 
@@ -309,7 +321,7 @@ void loop() {
       }
       // Operator-acknowledged recovery: fault condition cleared AND reset button pressed
       if (rccHealthy && !safetyViolation(plcLimits) && rcc.rideState == RCC_STATE_RESETTING) {
-        latchedFaults = 0;
+        badCrcFlag = false;
         plcState = keyOn ? STATE_OK : STATE_MAINT;
       }
       break;
@@ -323,12 +335,12 @@ void loop() {
 
     case STATE_MAINT:
       if (!keyMaint) { setEstop(true); plcState = STATE_OFF; break; }
-      if (!rccHealthy || safetyViolation(plcLimits)) { enterEstop(now, plcLimits); break; }
+      if (!rccHealthy || safetyViolation(plcLimits)) { enterEstop(now); break; }
       setEstop(false);
       break;
   }
 
-  sendPlcPacket(buildStatusByte());
+  sendPlcPacket(buildStatusByte(plcLimits));
 
   updateLed(now);
 }
