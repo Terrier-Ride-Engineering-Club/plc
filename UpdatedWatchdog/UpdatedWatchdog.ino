@@ -16,6 +16,16 @@
 #define PLC_PACKET_SIZE 10
 #define WATCHDOG_MS     50   // Max ms between valid RCC packets before unhealthy
 
+// RCC ride states (rcc.rideState field)
+#define RCC_STATE_OFF         0  // Key switch at OFF; awaiting power-on
+#define RCC_STATE_IDLE        1  // Powered and ready for operator input
+#define RCC_STATE_RUNNING     2  // Ride actively executing sequence
+#define RCC_STATE_STOPPING    3  // Controlled return to home/loading position (7s timeout → ESTOP)
+#define RCC_STATE_RESETTING   4  // 1-second fault-check window after E-stop reset is pressed
+#define RCC_STATE_ESTOP       5  // All motion halted; requires reset to clear
+#define RCC_STATE_FAULT       6  // Safety PLC has cut ride power
+#define RCC_STATE_MAINTENANCE 7  // Maintenance jog mode; dispatch unavailable
+
 // -- Safety Parameters --------------------------------------------------------
 // After E-stop is asserted, motors must stop within this window.
 // If still moving after this, escalate to Level 0 (FAULT).
@@ -36,7 +46,7 @@ enum PlcState {
   STATE_STARTING, // Key ON — relay on, awaiting first valid RCC handshake
   STATE_OK,       // Watchdog healthy, no violations — PLC E-stop gate open
   STATE_ESTOP,    // PLC asserting Level 1 E-stop
-  STATE_FAULT,    // Level 0 — relay cut, terminal until full power cycle
+  STATE_FAULT,    // Level 0 — relay cut, recoverable by key cycle to OFF
   STATE_MAINT     // Maintenance mode — automated ride logic disabled
 };
 
@@ -149,7 +159,7 @@ static void sendPlcPacket(uint8_t statusBits) {
 //  STARTING — 1 Hz blink         (waiting for RCC handshake)
 //  OK       — solid on           (healthy, E-stop released)
 //  ESTOP    — 2 Hz blink         (Level 1 E-stop asserted)
-//  FAULT    — 5 Hz blink         (Level 0 fault, terminal)
+//  FAULT    — 5 Hz blink         (Level 0 fault, recoverable by key cycle)
 //  MAINT    — double-pulse / sec (maintenance mode)
 static void updateLed(unsigned long now) {
   bool on;
@@ -166,6 +176,21 @@ static void updateLed(unsigned long now) {
   digitalWrite(LED_BUILTIN, on ? HIGH : LOW);
 }
 
+// -- Status Byte (PLC → RCC, offset 4) ---------------------------------------
+//
+// Status bits — reflect current PLC state (live each cycle):
+#define STATUS_ESTOP_RELEASED   0x01  // PLC E-stop gate open (not asserting)
+#define STATUS_PLC_OK           0x02  // All safety checks passing
+//
+// Fault bits — latched at ESTOP entry, cleared on recovery.
+// Multiple faults are OR'd together:
+#define FAULT_WATCHDOG          0x04  // RCC packets stopped
+#define FAULT_LIMIT_MISMATCH    0x08  // PLC and RCC limit switch readings disagree
+// bit 4 reserved
+#define FAULT_LEVEL0            0x20  // Relay cut — recoverable by key cycle to OFF
+#define FAULT_ECHO_COUNTER      0x40  // RCC not mirroring PLC counter
+#define FAULT_OVERSPEED         0x80  // Motor speed exceeded envelope during normal operation
+
 // -- Safety Checks ------------------------------------------------------------
 static bool motorsMoving() {
   return (rcc.m1Speed != 0) || (rcc.m2Speed != 0);
@@ -173,15 +198,14 @@ static bool motorsMoving() {
 
 // Returns a bitmask of all active fault bits, or 0 if all checks pass.
 // Shared by safetyViolation() and enterEstop() to avoid duplicating logic.
-// TODO: add speed/position/acceleration envelope checks once thresholds are defined.
+// TODO: add position/acceleration envelope checks once thresholds are defined.
 // TODO: confirm limit switch bit ordering matches RCC packet offset 66 before re-enabling.
 static uint8_t checkSafetyFaults(uint8_t plcLimits) {
   uint8_t faults = 0;
-  if (plcLimits != rcc.limitSwitches)                                                    faults |= FAULT_LIMIT_MISMATCH;
+  if (plcLimits != rcc.limitSwitches)                                                                                                           faults |= FAULT_LIMIT_MISMATCH;
   int16_t echoLag = (int16_t)((plcCounter - 1) - rcc.echoOfPlc);
-  if (echoLag < 0 || echoLag > ECHO_LAG_LIMIT)                                          faults |= FAULT_ECHO_COUNTER;
-  if (rcc.rideState == 5 && (abs(rcc.m1Speed) > 5 || abs(rcc.m2Speed) > 5))             faults |= FAULT_MOTION_POST_ESTOP;
-  if (abs(rcc.m1Speed) > MAX_MOTOR_SPEED || abs(rcc.m2Speed) > MAX_MOTOR_SPEED)         faults |= FAULT_OVERSPEED;
+  if (echoLag < 0 || echoLag > ECHO_LAG_LIMIT)                                                                                                faults |= FAULT_ECHO_COUNTER;
+  if (abs(rcc.m1Speed) > MAX_MOTOR_SPEED || abs(rcc.m2Speed) > MAX_MOTOR_SPEED)                                                                faults |= FAULT_OVERSPEED;
   return faults;
 }
 
@@ -197,26 +221,11 @@ static void enterEstop(unsigned long now, uint8_t plcLimits) {
   plcState = STATE_ESTOP;
 }
 
-// -- Status Byte (PLC → RCC, offset 4) ---------------------------------------
-//
-// Status bits — reflect current PLC state (live each cycle):
-#define STATUS_ESTOP_RELEASED   0x01  // PLC E-stop gate open (not asserting)
-#define STATUS_PLC_OK           0x02  // All safety checks passing
-//
-// Fault bits — latched at ESTOP entry, cleared on recovery.
-// Multiple faults are OR'd together:
-#define FAULT_WATCHDOG          0x04  // RCC packets stopped
-#define FAULT_LIMIT_MISMATCH    0x08  // PLC and RCC limit switch readings disagree
-#define FAULT_MOTION_POST_ESTOP 0x10  // Motors moving while RCC is in ESTOP
-#define FAULT_LEVEL0            0x20  // Relay cut — terminal, requires power cycle
-#define FAULT_ECHO_COUNTER      0x40  // RCC not mirroring PLC counter
-#define FAULT_OVERSPEED         0x80  // Motor speed exceeded MAX_MOTOR_SPEED
-
 static uint8_t buildStatusByte() {
   switch (plcState) {
     case STATE_OK:
     case STATE_MAINT:  return STATUS_ESTOP_RELEASED | STATUS_PLC_OK;
-    case STATE_ESTOP:  return latchedFaults | (motorsMoving() ? FAULT_MOTION_POST_ESTOP : 0);
+    case STATE_ESTOP:  return latchedFaults;
     case STATE_FAULT:  return latchedFaults | FAULT_LEVEL0;
     default:           return 0;
   }
@@ -298,17 +307,18 @@ void loop() {
         plcState = STATE_FAULT;
         break;
       }
-      // Auto-recovery: cause resolved — return to appropriate mode
-      if (rccHealthy && !safetyViolation(plcLimits)) {
+      // Operator-acknowledged recovery: fault condition cleared AND reset button pressed
+      if (rccHealthy && !safetyViolation(plcLimits) && rcc.rideState == RCC_STATE_RESETTING) {
         latchedFaults = 0;
         plcState = keyOn ? STATE_OK : STATE_MAINT;
       }
       break;
 
     case STATE_FAULT:
-      // Terminal. Cut power and hold. Requires a full physical power cycle.
+      // Relay cut, E-stop held. Recoverable by turning key to OFF.
       setEstop(true);
       setRelay(false);
+      if (!keyOn && !keyMaint) { plcState = STATE_OFF; }
       break;
 
     case STATE_MAINT:
