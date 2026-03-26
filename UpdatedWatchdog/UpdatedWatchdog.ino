@@ -24,6 +24,10 @@
 // Max cycles the RCC's echo of our counter may lag before flagging a fault.
 // At 20ms/cycle this is 100ms — enough to absorb one dropped packet.
 #define ECHO_LAG_LIMIT 5
+// The speed a motor can be at during an E-Stop before a Cat 0 Stop is thrown
+#define ESTOP_MOTOR_MOVE_THRESHOLD 5
+// The max speed a motor can be at during any point in operation of the ride
+#define MAX_MOTOR_SPEED 9500
 
 // -- PLC State Machine --------------------------------------------------------
 enum PlcState {
@@ -168,10 +172,11 @@ static bool motorsMoving() {
 // TODO: confirm limit switch bit ordering matches RCC packet offset 66 before re-enabling.
 static uint8_t checkSafetyFaults(uint8_t plcLimits) {
   uint8_t faults = 0;
-  if (plcLimits != rccLimitSwitches)                                  faults |= 0x08;  // limit switch mismatch
+  if (plcLimits != rccLimitSwitches)                                    faults |= 0x08;  // limit switch mismatch
   int16_t echoLag = (int16_t)((plcCounter - 1) - rccEchoOfPlc);
-  if (echoLag < 0 || echoLag > ECHO_LAG_LIMIT)                       faults |= 0x40;  // echo counter fault
-  if (rideState == 5 && (abs(m1Speed) > 5 || abs(m2Speed) > 5))      faults |= 0x10;  // motion while RCC in ESTOP
+  if (echoLag < 0 || echoLag > ECHO_LAG_LIMIT)                          faults |= 0x40;  // echo counter fault
+  if (rideState == 5 && (abs(m1Speed) > 5 || abs(m2Speed) > 5))         faults |= 0x10;  // motion while RCC in ESTOP
+  if (abs(m1Speed) > MAX_MOTOR_SPEED || abs(m2Speed) > MAX_MOTOR_SPEED) faults |= 0x80;  // motion fault
   return faults;
 }
 
