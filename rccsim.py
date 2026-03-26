@@ -4,7 +4,7 @@ import time
 
 PORT = "/dev/tty.usbmodem48CA432F71742"
 BAUD = 115200
-LOOP_INTERVAL = 0.002
+LOOP_INTERVAL = 0.02
 WATCHDOG_TIMEOUT = 0.05
 
 RIDE_STATES = {0: "OFF", 1: "IDLE", 2: "RUNNING", 3: "STOPPING",
@@ -17,7 +17,6 @@ plc_healthy = False
 
 # Last decoded PLC → RCC packet fields
 plc_status_bits  = 0
-plc_limit_sw     = 0
 plc_ctr          = 0
 plc_echo_ctr     = 0
 
@@ -47,13 +46,12 @@ while True:
         calc_crc = crc16(rx[:8])
 
         if received_crc == calc_crc:
-            my_counter, your_counter, status, limit_sw, _ = struct.unpack("<HHBBH", rx[:8])
+            my_counter, your_counter, status, _, __ = struct.unpack("<HHBBH", rx[:8])
 
             last_plc_counter = my_counter
             last_valid_time = time.monotonic()
             plc_healthy     = True
             plc_status_bits = status
-            plc_limit_sw    = limit_sw
             plc_ctr         = my_counter
             plc_echo_ctr    = your_counter
 
@@ -133,7 +131,7 @@ while True:
         f"TX  ctr={rcc_counter:5d}  state={RIDE_STATES.get(ride_state,'?'):9s}  M1={m1_speed:6d}  M2={m2_speed:6d}  lim={tx_limit_sw:04b}  V={voltage_raw/10:.1f}V"
         f"  |  "
         f"RX  ctr={plc_ctr:5d}  echo={plc_echo_ctr:5d}  comm={comm_str:12s}  checks={'OK' if plc_checks_ok else 'FAIL'}  estop={'Y' if plc_estop else 'N'}"
-        f"  lim={plc_limit_sw:04b}  faults=[{fault_str}]"
+        f"  faults=[{fault_str}]"
         f"\033[K",
         end='\n', flush=True
     )

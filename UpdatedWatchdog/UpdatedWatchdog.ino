@@ -7,10 +7,10 @@
 #define PIN_RELAY       2   // Power relay, active HIGH
 #define PIN_KEY_ON      3   // ON key switch, HIGH = ON
 #define PIN_KEY_MAINT   4   // MAINT key switch, HIGH = MAINT
-#define PIN_LIM_T1_BOT  6   // Tower 1 bottom limit, HIGH = triggered (NO)
-#define PIN_LIM_T1_TOP  7   // Tower 1 top limit
-#define PIN_LIM_T2_BOT  8   // Tower 2 bottom limit
-#define PIN_LIM_T2_TOP  9   // Tower 2 top limit
+#define PIN_LIM_T1_BOT  6   // Tower 1 bottom limit, HIGH = triggered (NC + INPUT_PULLUP; open wire = triggered)
+#define PIN_LIM_T1_TOP  7   // Tower 1 top limit    (NC + INPUT_PULLUP)
+#define PIN_LIM_T2_BOT  8   // Tower 2 bottom limit (NC + INPUT_PULLUP)
+#define PIN_LIM_T2_TOP  9   // Tower 2 top limit    (NC + INPUT_PULLUP)
 #define PIN_ESTOP       10  // E-stop control, active LOW (LOW = asserted)
 
 // ---------------------------------------------------------------------------
@@ -108,13 +108,13 @@ static bool parseRccPacket(const uint8_t *buf) {
   return true;
 }
 
-static void sendPlcPacket(uint8_t limitSwitches, uint8_t statusBits) {
+static void sendPlcPacket(uint8_t statusBits) {
   uint8_t tx[PLC_PACKET_SIZE];
 
   memcpy(tx + 0, &plcCounter,     2);
   memcpy(tx + 2, &lastRccCounter, 2);
   tx[4] = statusBits;
-  tx[5] = limitSwitches;
+  tx[5] = 0;  // reserved
   tx[6] = 0; tx[7] = 0;  // reserved
 
   uint16_t crc = crc16(tx, 8);
@@ -190,9 +190,9 @@ void setup() {
   pinMode(PIN_RELAY,      OUTPUT);
   pinMode(PIN_ESTOP,      OUTPUT);
   pinMode(LED_BUILTIN,        OUTPUT);
-  pinMode(PIN_KEY_ON,     INPUT);
-  pinMode(PIN_KEY_MAINT,  INPUT);
-  pinMode(PIN_LIM_T1_BOT, INPUT_PULLUP);
+  pinMode(PIN_KEY_ON,     INPUT);         // Requires external pulldown to rest LOW
+  pinMode(PIN_KEY_MAINT,  INPUT);         // Requires external pulldown to rest LOW
+  pinMode(PIN_LIM_T1_BOT, INPUT_PULLUP);  // NC switch; open wire reads HIGH = triggered
   pinMode(PIN_LIM_T1_TOP, INPUT_PULLUP);
   pinMode(PIN_LIM_T2_BOT, INPUT_PULLUP);
   pinMode(PIN_LIM_T2_TOP, INPUT_PULLUP);
@@ -314,7 +314,7 @@ void loop() {
   if (plcState == STATE_ESTOP)                   statusBits |= latchedFaults;  // latched at ESTOP entry
   if (plcState == STATE_ESTOP && motorsMoving()) statusBits |= 0x10;
   if (plcState == STATE_FAULT)                   statusBits |= latchedFaults | 0x20;
-  sendPlcPacket(plcLimits, statusBits);
+  sendPlcPacket(statusBits);
 
   updateLed(now);
 }
