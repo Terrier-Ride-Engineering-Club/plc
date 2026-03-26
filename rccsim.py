@@ -59,14 +59,15 @@ def _scenario_motion_in_estop(f):
 
 
 SCENARIOS = [
-    {"name": "NORMAL",            "desc": "Baseline — healthy operation",                "duration_s": 5,    "mutate": _scenario_normal},
-    {"name": "BAD_ECHO_CTR",      "desc": "Echo wrong PLC counter (+1000)",              "duration_s": 3,    "mutate": _scenario_bad_echo_counter},
-    {"name": "STALE_ECHO_CTR",    "desc": "Always echo counter 0 (frozen mirror)",       "duration_s": 3,    "mutate": _scenario_stale_echo_counter},
-    {"name": "BAD_CRC",           "desc": "Corrupt the packet CRC",                      "duration_s": 3,    "mutate": _scenario_bad_crc},
-    {"name": "NORMAL_RECOVERY",   "desc": "Resume normal after silence",                 "duration_s": 1,    "mutate": _scenario_normal},
-    {"name": "WDOG_SILENCE",      "desc": "Stop sending packets (watchdog timeout)",     "duration_s": 3,    "mutate": _scenario_watchdog_silence},
-    {"name": "NORMAL_RECOVERY",   "desc": "Resume normal after silence",                 "duration_s": 1,    "mutate": _scenario_normal},
-    {"name": "LIM_MISMATCH",      "desc": "Report limit switches disagreeing with PLC",  "duration_s": 5,    "mutate": _scenario_limit_mismatch},
+    # {"name": "NORMAL",            "desc": "Baseline — healthy operation",                "duration_s": 2,    "mutate": _scenario_normal},
+    # {"name": "BAD_ECHO_CTR",      "desc": "Echo wrong PLC counter (+1000)",              "duration_s": 3,    "mutate": _scenario_bad_echo_counter},
+    # {"name": "STALE_ECHO_CTR",    "desc": "Always echo counter 0 (frozen mirror)",       "duration_s": 3,    "mutate": _scenario_stale_echo_counter},
+    # {"name": "NORMAL_RECOVERY", "desc": "Resume normal after silence", "duration_s": 1, "mutate": _scenario_normal},
+    # {"name": "BAD_CRC",           "desc": "Corrupt the packet CRC",                      "duration_s": 3,    "mutate": _scenario_bad_crc},
+    # {"name": "NORMAL_RECOVERY",   "desc": "Resume normal after silence",                 "duration_s": 1,    "mutate": _scenario_normal},
+    # {"name": "WDOG_SILENCE",      "desc": "Stop sending packets (watchdog timeout)",     "duration_s": 3,    "mutate": _scenario_watchdog_silence},
+    # {"name": "NORMAL_RECOVERY",   "desc": "Resume normal after silence",                 "duration_s": 1,    "mutate": _scenario_normal},
+    # {"name": "LIM_MISMATCH",      "desc": "Report limit switches disagreeing with PLC",  "duration_s": 5,    "mutate": _scenario_limit_mismatch},
     {"name": "NORMAL_RECOVERY",   "desc": "Resume normal after silence",                 "duration_s": 1,    "mutate": _scenario_normal},
     {"name": "OVERSPEED",         "desc": "Report motor speed beyond safe envelope",     "duration_s": 5,    "mutate": _scenario_overspeed},
     {"name": "NORMAL_RECOVERY",   "desc": "Resume normal after silence",                 "duration_s": 1,    "mutate": _scenario_normal},
@@ -121,7 +122,7 @@ def build_fields(tx_counter, echo_ctr):
         "m2_cmd_speed":     0,
         "m2_cmd_accel":     0,
         "m2_cmd_decel":     0,
-        "ride_state":       1,      # IDLE
+        "ride_state":       2,      # RUNNING
         "tx_limit_sw":      0b1111,
         # injection flags (not packed directly)
         "corrupt_crc":      False,
@@ -223,6 +224,8 @@ while True:
     plc_motion     = bool(plc_status_bits & 0x10)
     plc_fault      = bool(plc_status_bits & 0x20)
     plc_echo_fault = bool(plc_status_bits & 0x40)
+    plc_motion_fault = bool(plc_status_bits & 0x80)
+
 
     if not plc_healthy:
         comm_str = "PLC→RCC:LOST"
@@ -236,6 +239,7 @@ while True:
     if plc_echo_fault: faults.append("ECHO_CTR_FAULT")
     if plc_motion:     faults.append("MOTION_POST_ESTOP")
     if plc_fault:      faults.append("LEVEL0_FAULT")
+    if plc_motion_fault: faults.append("MOTION_FAULT")
     fault_str = ",".join(faults) if faults else "none"
 
     sc_elapsed, sc_total = runner.elapsed()
