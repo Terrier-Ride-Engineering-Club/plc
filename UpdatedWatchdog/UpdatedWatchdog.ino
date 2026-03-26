@@ -29,6 +29,7 @@
 // The max speed a motor can be at during any point in operation of the ride
 #define MAX_MOTOR_SPEED 9500
 
+
 // -- PLC State Machine --------------------------------------------------------
 enum PlcState {
   STATE_OFF,      // Key at OFF — relay de-energized, everything dark
@@ -39,37 +40,41 @@ enum PlcState {
   STATE_MAINT     // Maintenance mode — automated ride logic disabled
 };
 
+// -- RCC Packet Data ----------------------------------------------------------
+// Fields extracted from the most recent valid RCC → PLC packet.
+struct RccPacket {
+  uint16_t myCounter;          // offset 0  — RCC's own counter
+  uint16_t echoOfPlc;          // offset 2  — RCC's echo of our counter
+  uint8_t  statusBits;         // offset 4
+  int32_t  m1Speed;            // offset 5
+  int32_t  m1Encoder;          // offset 9
+  int16_t  m1Current;          // offset 13
+  int32_t  m2Speed;            // offset 15
+  int32_t  m2Encoder;          // offset 19
+  int16_t  m2Current;          // offset 23
+  uint16_t mcVoltage;          // offset 25
+  uint32_t mcStatus;           // offset 27
+  uint16_t mcTimeSinceUpdate;  // offset 31
+  int32_t  m1CmdPos;           // offset 33
+  int32_t  m1CmdSpeed;         // offset 37
+  uint32_t m1CmdAccel;         // offset 41
+  uint32_t m1CmdDecel;         // offset 45
+  int32_t  m2CmdPos;           // offset 49
+  int32_t  m2CmdSpeed;         // offset 53
+  uint32_t m2CmdAccel;         // offset 57
+  uint32_t m2CmdDecel;         // offset 61
+  uint8_t  rideState;          // offset 65
+  uint8_t  limitSwitches;      // offset 66
+};
+
 // -- Global State -------------------------------------------------------------
 static PlcState      plcState          = STATE_OFF;
 static uint16_t      plcCounter        = 0;
-static uint16_t      lastRccCounter    = 0;
 static unsigned long lastValidPacketMs = 0;
 static unsigned long estopAssertedMs   = 0;
 static bool          rccHealthy        = false;
 static uint8_t       latchedFaults     = 0;  // Latched at ESTOP entry; held until recovery
-
-// Fields extracted from the most recent valid RCC packet
-static uint8_t  rccStatusBits       = 0;  // offset 4
-static int32_t  m1Speed             = 0;  // offset 5
-static int32_t  m1Encoder           = 0;  // offset 9
-static int16_t  m1Current           = 0;  // offset 13
-static int32_t  m2Speed             = 0;  // offset 15
-static int32_t  m2Encoder           = 0;  // offset 19
-static int16_t  m2Current           = 0;  // offset 23
-static uint16_t mcVoltage           = 0;  // offset 25
-static uint32_t mcStatus            = 0;  // offset 27
-static uint16_t mcTimeSinceUpdate   = 0;  // offset 31
-static int32_t  m1CmdPos            = 0;  // offset 33
-static int32_t  m1CmdSpeed          = 0;  // offset 37
-static uint32_t m1CmdAccel          = 0;  // offset 41
-static uint32_t m1CmdDecel          = 0;  // offset 45
-static int32_t  m2CmdPos            = 0;  // offset 49
-static int32_t  m2CmdSpeed          = 0;  // offset 53
-static uint32_t m2CmdAccel          = 0;  // offset 57
-static uint32_t m2CmdDecel          = 0;  // offset 61
-static uint8_t  rideState           = 0;  // offset 65
-static uint8_t  rccLimitSwitches    = 0;  // offset 66
-static uint16_t rccEchoOfPlc        = 0;  // offset 2 — RCC's echo of our counter
+static RccPacket     rcc               = {}; // Most recent valid RCC packet
 
 // -- CRC16 — ANSI, poly 0x8005 ------------------------------------------------
 static uint16_t crc16(const uint8_t *data, uint16_t len) {
@@ -102,35 +107,35 @@ static bool parseRccPacket(const uint8_t *buf) {
   uint16_t rxCrc = (uint16_t)buf[67] | ((uint16_t)buf[68] << 8);
   if (crc16(buf, 67) != rxCrc) return false;
 
-  lastRccCounter      = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
-  rccEchoOfPlc        = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
-  rccStatusBits       = buf[4];
-  memcpy(&m1Speed,          buf + 5,  sizeof(m1Speed));
-  memcpy(&m1Encoder,        buf + 9,  sizeof(m1Encoder));
-  memcpy(&m1Current,        buf + 13, sizeof(m1Current));
-  memcpy(&m2Speed,          buf + 15, sizeof(m2Speed));
-  memcpy(&m2Encoder,        buf + 19, sizeof(m2Encoder));
-  memcpy(&m2Current,        buf + 23, sizeof(m2Current));
-  memcpy(&mcVoltage,        buf + 25, sizeof(mcVoltage));
-  memcpy(&mcStatus,         buf + 27, sizeof(mcStatus));
-  memcpy(&mcTimeSinceUpdate,buf + 31, sizeof(mcTimeSinceUpdate));
-  memcpy(&m1CmdPos,         buf + 33, sizeof(m1CmdPos));
-  memcpy(&m1CmdSpeed,       buf + 37, sizeof(m1CmdSpeed));
-  memcpy(&m1CmdAccel,       buf + 41, sizeof(m1CmdAccel));
-  memcpy(&m1CmdDecel,       buf + 45, sizeof(m1CmdDecel));
-  memcpy(&m2CmdPos,         buf + 49, sizeof(m2CmdPos));
-  memcpy(&m2CmdSpeed,       buf + 53, sizeof(m2CmdSpeed));
-  memcpy(&m2CmdAccel,       buf + 57, sizeof(m2CmdAccel));
-  memcpy(&m2CmdDecel,       buf + 61, sizeof(m2CmdDecel));
-  rideState           = buf[65];
-  rccLimitSwitches    = buf[66];
+  rcc.myCounter        = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+  rcc.echoOfPlc        = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+  rcc.statusBits       = buf[4];
+  memcpy(&rcc.m1Speed,          buf + 5,  sizeof(rcc.m1Speed));
+  memcpy(&rcc.m1Encoder,        buf + 9,  sizeof(rcc.m1Encoder));
+  memcpy(&rcc.m1Current,        buf + 13, sizeof(rcc.m1Current));
+  memcpy(&rcc.m2Speed,          buf + 15, sizeof(rcc.m2Speed));
+  memcpy(&rcc.m2Encoder,        buf + 19, sizeof(rcc.m2Encoder));
+  memcpy(&rcc.m2Current,        buf + 23, sizeof(rcc.m2Current));
+  memcpy(&rcc.mcVoltage,        buf + 25, sizeof(rcc.mcVoltage));
+  memcpy(&rcc.mcStatus,         buf + 27, sizeof(rcc.mcStatus));
+  memcpy(&rcc.mcTimeSinceUpdate,buf + 31, sizeof(rcc.mcTimeSinceUpdate));
+  memcpy(&rcc.m1CmdPos,         buf + 33, sizeof(rcc.m1CmdPos));
+  memcpy(&rcc.m1CmdSpeed,       buf + 37, sizeof(rcc.m1CmdSpeed));
+  memcpy(&rcc.m1CmdAccel,       buf + 41, sizeof(rcc.m1CmdAccel));
+  memcpy(&rcc.m1CmdDecel,       buf + 45, sizeof(rcc.m1CmdDecel));
+  memcpy(&rcc.m2CmdPos,         buf + 49, sizeof(rcc.m2CmdPos));
+  memcpy(&rcc.m2CmdSpeed,       buf + 53, sizeof(rcc.m2CmdSpeed));
+  memcpy(&rcc.m2CmdAccel,       buf + 57, sizeof(rcc.m2CmdAccel));
+  memcpy(&rcc.m2CmdDecel,       buf + 61, sizeof(rcc.m2CmdDecel));
+  rcc.rideState        = buf[65];
+  rcc.limitSwitches    = buf[66];
   return true;
 }
 
 static void sendPlcPacket(uint8_t statusBits) {
   uint8_t tx[PLC_PACKET_SIZE];
-  memcpy(tx + 0, &plcCounter,     2);
-  memcpy(tx + 2, &lastRccCounter, 2);
+  memcpy(tx + 0, &plcCounter,      2);
+  memcpy(tx + 2, &rcc.myCounter,  2);
   tx[4] = statusBits;
   tx[5] = 0; tx[6] = 0; tx[7] = 0;  // reserved
   uint16_t crc = crc16(tx, 8);
@@ -163,7 +168,7 @@ static void updateLed(unsigned long now) {
 
 // -- Safety Checks ------------------------------------------------------------
 static bool motorsMoving() {
-  return (m1Speed != 0) || (m2Speed != 0);
+  return (rcc.m1Speed != 0) || (rcc.m2Speed != 0);
 }
 
 // Returns a bitmask of all active fault bits, or 0 if all checks pass.
@@ -172,11 +177,11 @@ static bool motorsMoving() {
 // TODO: confirm limit switch bit ordering matches RCC packet offset 66 before re-enabling.
 static uint8_t checkSafetyFaults(uint8_t plcLimits) {
   uint8_t faults = 0;
-  if (plcLimits != rccLimitSwitches)                                    faults |= 0x08;  // limit switch mismatch
-  int16_t echoLag = (int16_t)((plcCounter - 1) - rccEchoOfPlc);
-  if (echoLag < 0 || echoLag > ECHO_LAG_LIMIT)                          faults |= 0x40;  // echo counter fault
-  if (rideState == 5 && (abs(m1Speed) > 5 || abs(m2Speed) > 5))         faults |= 0x10;  // motion while RCC in ESTOP
-  if (abs(m1Speed) > MAX_MOTOR_SPEED || abs(m2Speed) > MAX_MOTOR_SPEED) faults |= 0x80;  // motion fault
+  if (plcLimits != rcc.limitSwitches)                                                    faults |= FAULT_LIMIT_MISMATCH;
+  int16_t echoLag = (int16_t)((plcCounter - 1) - rcc.echoOfPlc);
+  if (echoLag < 0 || echoLag > ECHO_LAG_LIMIT)                                          faults |= FAULT_ECHO_COUNTER;
+  if (rcc.rideState == 5 && (abs(rcc.m1Speed) > 5 || abs(rcc.m2Speed) > 5))             faults |= FAULT_MOTION_POST_ESTOP;
+  if (abs(rcc.m1Speed) > MAX_MOTOR_SPEED || abs(rcc.m2Speed) > MAX_MOTOR_SPEED)         faults |= FAULT_OVERSPEED;
   return faults;
 }
 
@@ -188,8 +193,33 @@ static bool safetyViolation(uint8_t plcLimits) {
 static void enterEstop(unsigned long now, uint8_t plcLimits) {
   estopAssertedMs = now;
   latchedFaults   = checkSafetyFaults(plcLimits);
-  if (!rccHealthy) latchedFaults |= 0x04;  // watchdog fault (checked separately from safetyViolation)
+  if (!rccHealthy) latchedFaults |= FAULT_WATCHDOG;
   plcState = STATE_ESTOP;
+}
+
+// -- Status Byte (PLC → RCC, offset 4) ---------------------------------------
+//
+// Status bits — reflect current PLC state (live each cycle):
+#define STATUS_ESTOP_RELEASED   0x01  // PLC E-stop gate open (not asserting)
+#define STATUS_PLC_OK           0x02  // All safety checks passing
+//
+// Fault bits — latched at ESTOP entry, cleared on recovery.
+// Multiple faults are OR'd together:
+#define FAULT_WATCHDOG          0x04  // RCC packets stopped
+#define FAULT_LIMIT_MISMATCH    0x08  // PLC and RCC limit switch readings disagree
+#define FAULT_MOTION_POST_ESTOP 0x10  // Motors moving while RCC is in ESTOP
+#define FAULT_LEVEL0            0x20  // Relay cut — terminal, requires power cycle
+#define FAULT_ECHO_COUNTER      0x40  // RCC not mirroring PLC counter
+#define FAULT_OVERSPEED         0x80  // Motor speed exceeded MAX_MOTOR_SPEED
+
+static uint8_t buildStatusByte() {
+  switch (plcState) {
+    case STATE_OK:
+    case STATE_MAINT:  return STATUS_ESTOP_RELEASED | STATUS_PLC_OK;
+    case STATE_ESTOP:  return latchedFaults | (motorsMoving() ? FAULT_MOTION_POST_ESTOP : 0);
+    case STATE_FAULT:  return latchedFaults | FAULT_LEVEL0;
+    default:           return 0;
+  }
 }
 
 // -- Setup --------------------------------------------------------------------
@@ -288,16 +318,7 @@ void loop() {
       break;
   }
 
-  // -- Build status byte and transmit --
-  // Bit 0: E-stop released  Bit 1: I'm OK
-  // Bit 2: Watchdog fault   Bit 3: Limit switch mismatch
-  // Bit 4: Motion post-stop Bit 5: Level 0 fault (terminal)  Bit 6: Echo counter fault
-  uint8_t statusBits = 0;
-  if (plcState == STATE_OK   || plcState == STATE_MAINT)  statusBits |= 0x03;
-  if (plcState == STATE_ESTOP)                             statusBits |= latchedFaults;
-  if (plcState == STATE_ESTOP && motorsMoving())           statusBits |= 0x10;
-  if (plcState == STATE_FAULT)                             statusBits |= latchedFaults | 0x20;
-  sendPlcPacket(statusBits);
+  sendPlcPacket(buildStatusByte());
 
   updateLed(now);
 }
