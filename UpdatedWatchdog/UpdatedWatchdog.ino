@@ -1,5 +1,6 @@
 #include <Arduino.h>
 
+
 // ---------------------------------------------------------------------------
 // Pin Definitions
 // ---------------------------------------------------------------------------
@@ -49,6 +50,7 @@ static uint16_t      lastRccCounter    = 0;
 static unsigned long lastValidPacketMs = 0;
 static unsigned long estopAssertedMs   = 0;
 static bool          rccHealthy        = false;
+static uint8_t       latchedFaults     = 0;  // Fault bits latched at ESTOP entry; held until recovery
 
 // Fields extracted from the most recent valid RCC packet
 static int32_t  m1Speed          = 0;
@@ -106,12 +108,8 @@ static bool parseRccPacket(const uint8_t *buf) {
   return true;
 }
 
-static void sendPlcPacket(uint8_t limitSwitches, bool plcOk, bool estopAsserted) {
+static void sendPlcPacket(uint8_t limitSwitches, uint8_t statusBits) {
   uint8_t tx[PLC_PACKET_SIZE];
-
-  uint8_t statusBits = 0;
-  if (plcOk)          statusBits |= 0x02;  // bit 1: I'm OK
-  if (!estopAsserted) statusBits |= 0x01;  // bit 0: E-stop released
 
   memcpy(tx + 0, &plcCounter,     2);
   memcpy(tx + 2, &lastRccCounter, 2);
@@ -122,8 +120,36 @@ static void sendPlcPacket(uint8_t limitSwitches, bool plcOk, bool estopAsserted)
   uint16_t crc = crc16(tx, 8);
   memcpy(tx + 8, &crc, 2);
 
-  Serial.write(tx, PLC_PACKET_SIZE);
-  plcCounter++;
+  // Only write if the TX buffer has room — Serial.write() blocks if full,
+  // which would freeze the entire loop including the safety-critical RX path.
+  if (Serial.availableForWrite() >= PLC_PACKET_SIZE) {
+    Serial.write(tx, PLC_PACKET_SIZE);
+    plcCounter++;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// LED Status Indicator
+// ---------------------------------------------------------------------------
+//  OFF      — LED off            (system dark)
+//  STARTING — 1 Hz blink         (waiting for RCC handshake)
+//  OK       — solid on           (healthy, E-stop released)
+//  ESTOP    — 2 Hz blink         (Level 1 E-stop asserted)
+//  FAULT    — 5 Hz blink         (Level 0 fault, terminal)
+//  MAINT    — double-pulse / sec (maintenance mode)
+static void updateLed(unsigned long now) {
+  bool on;
+  switch (plcState) {
+    case STATE_OFF:      on = false;                                              break;
+    case STATE_STARTING: on = (now % 1000) < 500;                                break;
+    case STATE_OK:       on = true;                                               break;
+    case STATE_ESTOP:    on = (now % 500)  < 250;                                break;
+    case STATE_FAULT:    on = (now % 200)  < 100;                                break;
+    case STATE_MAINT:  { unsigned long t = now % 1000;
+                         on = (t < 100) || (t >= 200 && t < 300);               break; }
+    default:             on = false;
+  }
+  digitalWrite(LED_BUILTIN, on ? HIGH : LOW);
 }
 
 // ---------------------------------------------------------------------------
@@ -141,10 +167,20 @@ static bool limitSwitchMismatch(uint8_t plcLimits) {
 }
 
 // Returns true if any condition requires the PLC to assert E-stop.
-// TODO: add position / speed / acceleration envelope checks once spec is finalized.
 static bool safetyViolation(uint8_t plcLimits) {
-  if (limitSwitchMismatch(plcLimits)) return true;
+  // TODO ADD SAFETY VIOLATIONS
+  // if (limitSwitchMismatch(plcLimits)) return true;
   return false;
+}
+
+// Transitions into STATE_ESTOP, latching the triggering fault bits for diagnostics.
+// Fault bits are held until the system fully recovers so the RCC always sees why.
+static void enterEstop(unsigned long now, uint8_t plcLimits) {
+  estopAssertedMs = now;
+  latchedFaults   = 0;
+  if (!rccHealthy)                    latchedFaults |= 0x04;  // watchdog fault
+  if (limitSwitchMismatch(plcLimits)) latchedFaults |= 0x08;  // limit switch mismatch
+  plcState = STATE_ESTOP;
 }
 
 // ---------------------------------------------------------------------------
@@ -153,12 +189,13 @@ static bool safetyViolation(uint8_t plcLimits) {
 void setup() {
   pinMode(PIN_RELAY,      OUTPUT);
   pinMode(PIN_ESTOP,      OUTPUT);
+  pinMode(LED_BUILTIN,        OUTPUT);
   pinMode(PIN_KEY_ON,     INPUT);
   pinMode(PIN_KEY_MAINT,  INPUT);
-  pinMode(PIN_LIM_T1_BOT, INPUT);
-  pinMode(PIN_LIM_T1_TOP, INPUT);
-  pinMode(PIN_LIM_T2_BOT, INPUT);
-  pinMode(PIN_LIM_T2_TOP, INPUT);
+  pinMode(PIN_LIM_T1_BOT, INPUT_PULLUP);
+  pinMode(PIN_LIM_T1_TOP, INPUT_PULLUP);
+  pinMode(PIN_LIM_T2_BOT, INPUT_PULLUP);
+  pinMode(PIN_LIM_T2_TOP, INPUT_PULLUP);
 
   setRelay(false);  // Everything off at boot
   setEstop(true);   // E-stop asserted until system is ready
@@ -171,20 +208,39 @@ void setup() {
 // Main Loop
 // ---------------------------------------------------------------------------
 void loop() {
-  unsigned long now       = millis();
-  uint8_t       plcLimits = readLimitSwitches();
-  bool          keyOn     = (digitalRead(PIN_KEY_ON)    == HIGH);
-  bool          keyMaint  = (digitalRead(PIN_KEY_MAINT) == HIGH);
+  unsigned long now = millis();
 
-  // ---- Receive RCC packet ----
-  if (Serial.available() >= RCC_PACKET_SIZE) {
-    uint8_t buf[RCC_PACKET_SIZE];
-    Serial.readBytes(buf, RCC_PACKET_SIZE);
-    if (parseRccPacket(buf)) {
+  // ---- Run state machine every 20 ms ----
+  static unsigned long lastTxMs = 0;
+  if (now - lastTxMs < 20) return;
+  lastTxMs = now;
+
+  // ---- Flush stale bytes, then wait for one fresh packet ----
+  // Any bytes already in the buffer are from a previous cycle or a boot-time
+  // backlog.  Discarding them before receiving ensures the state machine always
+  // acts on data from THIS cycle, keeping the echo counter current.
+  // The RCC sends every 20 ms; after the flush the next packet arrives within
+  // WATCHDOG_MS, so one missed alignment never trips the watchdog.
+  while (Serial.available()) Serial.read();
+
+  {
+    uint8_t rxBuf[RCC_PACKET_SIZE];
+    uint8_t rxLen = 0;
+    unsigned long waitStart = millis();
+    while (rxLen < RCC_PACKET_SIZE) {
+      if (Serial.available() > 0) rxBuf[rxLen++] = Serial.read();
+      if (millis() - waitStart > WATCHDOG_MS) break;
+    }
+    now = millis();  // refresh after blocking wait
+    if (rxLen == RCC_PACKET_SIZE && parseRccPacket(rxBuf)) {
       lastValidPacketMs = now;
       rccHealthy = true;
     }
   }
+
+  uint8_t plcLimits = readLimitSwitches();
+  bool    keyOn     = (digitalRead(PIN_KEY_ON)    == HIGH);
+  bool    keyMaint  = (digitalRead(PIN_KEY_MAINT) == HIGH);
 
   // ---- Watchdog ----
   if (now - lastValidPacketMs > WATCHDOG_MS) {
@@ -211,8 +267,7 @@ void loop() {
     case STATE_OK:
       if (!keyOn) { plcState = STATE_OFF; break; }
       if (!rccHealthy || safetyViolation(plcLimits)) {
-        estopAssertedMs = now;
-        plcState = STATE_ESTOP;
+        enterEstop(now, plcLimits);
         break;
       }
       setEstop(false);  // All checks pass — open PLC E-stop gate
@@ -226,8 +281,9 @@ void loop() {
         plcState = STATE_FAULT;
         break;
       }
-      // Auto-recovery: cause resolved — return to the appropriate mode
+      // Auto-recovery: cause resolved — clear latched faults and return to appropriate mode
       if (rccHealthy && !safetyViolation(plcLimits)) {
+        latchedFaults = 0;
         plcState = keyOn ? STATE_OK : STATE_MAINT;
       }
       break;
@@ -241,18 +297,24 @@ void loop() {
     case STATE_MAINT:
       if (!keyMaint) { setEstop(true); plcState = STATE_OFF; break; }
       if (!rccHealthy || safetyViolation(plcLimits)) {
-        estopAssertedMs = now;
-        plcState = STATE_ESTOP;
+        enterEstop(now, plcLimits);
         break;
       }
       setEstop(false);
       break;
   }
 
-  // ---- Send PLC packet every cycle ----
-  bool plcOk         = (plcState == STATE_OK || plcState == STATE_MAINT);
-  bool estopAsserted = (plcState != STATE_OK  && plcState != STATE_MAINT);
-  sendPlcPacket(plcLimits, plcOk, estopAsserted);
+  // ---- Build status byte and send PLC packet ----
+  // Bit 0: E-stop released     Bit 1: I'm OK
+  // Bit 2: Watchdog fault       Bit 3: Limit switch mismatch
+  // Bit 4: Motion after E-stop  Bit 5: Level 0 fault (terminal)
+  bool plcOk = (plcState == STATE_OK || plcState == STATE_MAINT);
+  uint8_t statusBits = 0;
+  if (plcOk)                                     statusBits |= 0x03;  // bits 0+1: OK and E-stop released
+  if (plcState == STATE_ESTOP)                   statusBits |= latchedFaults;  // latched at ESTOP entry
+  if (plcState == STATE_ESTOP && motorsMoving()) statusBits |= 0x10;
+  if (plcState == STATE_FAULT)                   statusBits |= latchedFaults | 0x20;
+  sendPlcPacket(plcLimits, statusBits);
 
-  delay(10);
+  updateLed(now);
 }
