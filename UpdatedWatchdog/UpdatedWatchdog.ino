@@ -21,6 +21,9 @@
 // If still moving after this, escalate to Level 0 (FAULT).
 // TODO: confirm acceptable deceleration time with hardware team.
 #define MOTION_STOP_TIMEOUT_MS 2000
+// Max cycles the RCC's echo of our counter may lag before flagging a fault.
+// At 20ms/cycle this is 100ms — enough to absorb one dropped packet.
+#define ECHO_LAG_LIMIT 5
 
 // -- PLC State Machine --------------------------------------------------------
 enum PlcState {
@@ -42,9 +45,27 @@ static bool          rccHealthy        = false;
 static uint8_t       latchedFaults     = 0;  // Latched at ESTOP entry; held until recovery
 
 // Fields extracted from the most recent valid RCC packet
-static int32_t  m1Speed          = 0;
-static int32_t  m2Speed          = 0;
-static uint8_t  rccLimitSwitches = 0;
+static uint8_t  rccStatusBits       = 0;  // offset 4
+static int32_t  m1Speed             = 0;  // offset 5
+static int32_t  m1Encoder           = 0;  // offset 9
+static int16_t  m1Current           = 0;  // offset 13
+static int32_t  m2Speed             = 0;  // offset 15
+static int32_t  m2Encoder           = 0;  // offset 19
+static int16_t  m2Current           = 0;  // offset 23
+static uint16_t mcVoltage           = 0;  // offset 25
+static uint32_t mcStatus            = 0;  // offset 27
+static uint16_t mcTimeSinceUpdate   = 0;  // offset 31
+static int32_t  m1CmdPos            = 0;  // offset 33
+static int32_t  m1CmdSpeed          = 0;  // offset 37
+static uint32_t m1CmdAccel          = 0;  // offset 41
+static uint32_t m1CmdDecel          = 0;  // offset 45
+static int32_t  m2CmdPos            = 0;  // offset 49
+static int32_t  m2CmdSpeed          = 0;  // offset 53
+static uint32_t m2CmdAccel          = 0;  // offset 57
+static uint32_t m2CmdDecel          = 0;  // offset 61
+static uint8_t  rideState           = 0;  // offset 65
+static uint8_t  rccLimitSwitches    = 0;  // offset 66
+static uint16_t rccEchoOfPlc        = 0;  // offset 2 — RCC's echo of our counter
 
 // -- CRC16 — ANSI, poly 0x8005 ------------------------------------------------
 static uint16_t crc16(const uint8_t *data, uint16_t len) {
@@ -77,10 +98,28 @@ static bool parseRccPacket(const uint8_t *buf) {
   uint16_t rxCrc = (uint16_t)buf[67] | ((uint16_t)buf[68] << 8);
   if (crc16(buf, 67) != rxCrc) return false;
 
-  lastRccCounter   = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
-  memcpy(&m1Speed,  buf + 5,  sizeof(m1Speed));
-  memcpy(&m2Speed,  buf + 15, sizeof(m2Speed));
-  rccLimitSwitches = buf[66];
+  lastRccCounter      = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+  rccEchoOfPlc        = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+  rccStatusBits       = buf[4];
+  memcpy(&m1Speed,          buf + 5,  sizeof(m1Speed));
+  memcpy(&m1Encoder,        buf + 9,  sizeof(m1Encoder));
+  memcpy(&m1Current,        buf + 13, sizeof(m1Current));
+  memcpy(&m2Speed,          buf + 15, sizeof(m2Speed));
+  memcpy(&m2Encoder,        buf + 19, sizeof(m2Encoder));
+  memcpy(&m2Current,        buf + 23, sizeof(m2Current));
+  memcpy(&mcVoltage,        buf + 25, sizeof(mcVoltage));
+  memcpy(&mcStatus,         buf + 27, sizeof(mcStatus));
+  memcpy(&mcTimeSinceUpdate,buf + 31, sizeof(mcTimeSinceUpdate));
+  memcpy(&m1CmdPos,         buf + 33, sizeof(m1CmdPos));
+  memcpy(&m1CmdSpeed,       buf + 37, sizeof(m1CmdSpeed));
+  memcpy(&m1CmdAccel,       buf + 41, sizeof(m1CmdAccel));
+  memcpy(&m1CmdDecel,       buf + 45, sizeof(m1CmdDecel));
+  memcpy(&m2CmdPos,         buf + 49, sizeof(m2CmdPos));
+  memcpy(&m2CmdSpeed,       buf + 53, sizeof(m2CmdSpeed));
+  memcpy(&m2CmdAccel,       buf + 57, sizeof(m2CmdAccel));
+  memcpy(&m2CmdDecel,       buf + 61, sizeof(m2CmdDecel));
+  rideState           = buf[65];
+  rccLimitSwitches    = buf[66];
   return true;
 }
 
@@ -123,20 +162,28 @@ static bool motorsMoving() {
   return (m1Speed != 0) || (m2Speed != 0);
 }
 
-// Returns true if any condition requires the PLC to assert E-stop.
-// TODO: add position / speed / acceleration envelope checks once spec is finalized.
+// Returns a bitmask of all active fault bits, or 0 if all checks pass.
+// Shared by safetyViolation() and enterEstop() to avoid duplicating logic.
+// TODO: add speed/position/acceleration envelope checks once thresholds are defined.
 // TODO: confirm limit switch bit ordering matches RCC packet offset 66 before re-enabling.
+static uint8_t checkSafetyFaults(uint8_t plcLimits) {
+  uint8_t faults = 0;
+  if (plcLimits != rccLimitSwitches)                                  faults |= 0x08;  // limit switch mismatch
+  int16_t echoLag = (int16_t)((plcCounter - 1) - rccEchoOfPlc);
+  if (echoLag < 0 || echoLag > ECHO_LAG_LIMIT)                       faults |= 0x40;  // echo counter fault
+  if (rideState == 5 && (abs(m1Speed) > 5 || abs(m2Speed) > 5))      faults |= 0x10;  // motion while RCC in ESTOP
+  return faults;
+}
+
 static bool safetyViolation(uint8_t plcLimits) {
-  // if (plcLimits != rccLimitSwitches) return true;  // limit switch cross-check
-  return false;
+  return checkSafetyFaults(plcLimits) != 0;
 }
 
 // Transitions into STATE_ESTOP, latching the triggering fault bits for diagnostics.
 static void enterEstop(unsigned long now, uint8_t plcLimits) {
   estopAssertedMs = now;
-  latchedFaults   = 0;
-  if (!rccHealthy)                       latchedFaults |= 0x04;  // watchdog fault
-  if (plcLimits != rccLimitSwitches)     latchedFaults |= 0x08;  // limit switch mismatch
+  latchedFaults   = checkSafetyFaults(plcLimits);
+  if (!rccHealthy) latchedFaults |= 0x04;  // watchdog fault (checked separately from safetyViolation)
   plcState = STATE_ESTOP;
 }
 
@@ -239,7 +286,7 @@ void loop() {
   // -- Build status byte and transmit --
   // Bit 0: E-stop released  Bit 1: I'm OK
   // Bit 2: Watchdog fault   Bit 3: Limit switch mismatch
-  // Bit 4: Motion post-stop Bit 5: Level 0 fault (terminal)
+  // Bit 4: Motion post-stop Bit 5: Level 0 fault (terminal)  Bit 6: Echo counter fault
   uint8_t statusBits = 0;
   if (plcState == STATE_OK   || plcState == STATE_MAINT)  statusBits |= 0x03;
   if (plcState == STATE_ESTOP)                             statusBits |= latchedFaults;
