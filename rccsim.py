@@ -49,30 +49,33 @@ def _scenario_limit_mismatch(f):
     f["tx_limit_sw"] = 0b1100
 
 def _scenario_overspeed(f):
-    """Report motor speed outside the safe envelope."""
+    """Report motor speed outside the safe envelope — triggers FAULT_MOTION."""
     f["m1_speed"] = 50000   # large QPPS value
 
-def _scenario_motion_in_estop(f):
-    """Report non-zero motor speed while reporting ESTOP state."""
-    f["ride_state"] = 5     # ESTOP
-    f["m1_speed"] = 1000    # but motor is still moving
+def _scenario_resetting(f):
+    """Simulate operator pressing reset — RCC enters RESETTING state briefly."""
+    f["ride_state"] = 4     # RESETTING
 
 
 SCENARIOS = [
-    # {"name": "NORMAL",            "desc": "Baseline — healthy operation",                "duration_s": 2,    "mutate": _scenario_normal},
-    # {"name": "BAD_ECHO_CTR",      "desc": "Echo wrong PLC counter (+1000)",              "duration_s": 3,    "mutate": _scenario_bad_echo_counter},
-    # {"name": "STALE_ECHO_CTR",    "desc": "Always echo counter 0 (frozen mirror)",       "duration_s": 3,    "mutate": _scenario_stale_echo_counter},
-    # {"name": "NORMAL_RECOVERY", "desc": "Resume normal after silence", "duration_s": 1, "mutate": _scenario_normal},
-    # {"name": "BAD_CRC",           "desc": "Corrupt the packet CRC",                      "duration_s": 3,    "mutate": _scenario_bad_crc},
-    # {"name": "NORMAL_RECOVERY",   "desc": "Resume normal after silence",                 "duration_s": 1,    "mutate": _scenario_normal},
-    # {"name": "WDOG_SILENCE",      "desc": "Stop sending packets (watchdog timeout)",     "duration_s": 3,    "mutate": _scenario_watchdog_silence},
-    # {"name": "NORMAL_RECOVERY",   "desc": "Resume normal after silence",                 "duration_s": 1,    "mutate": _scenario_normal},
-    # {"name": "LIM_MISMATCH",      "desc": "Report limit switches disagreeing with PLC",  "duration_s": 5,    "mutate": _scenario_limit_mismatch},
-    {"name": "NORMAL_RECOVERY",   "desc": "Resume normal after silence",                 "duration_s": 1,    "mutate": _scenario_normal},
-    {"name": "OVERSPEED",         "desc": "Report motor speed beyond safe envelope",     "duration_s": 5,    "mutate": _scenario_overspeed},
-    {"name": "NORMAL_RECOVERY",   "desc": "Resume normal after silence",                 "duration_s": 1,    "mutate": _scenario_normal},
-    {"name": "MOTION_IN_ESTOP",   "desc": "Report motion while in ESTOP state",          "duration_s": 5,    "mutate": _scenario_motion_in_estop},
-    {"name": "NORMAL_FINAL",      "desc": "Return to healthy — end of test sequence",    "duration_s": None, "mutate": _scenario_normal},
+    {"name": "NORMAL",          "desc": "Baseline — healthy operation",               "duration_s": 2,    "mutate": _scenario_normal},
+    {"name": "BAD_ECHO_CTR",   "desc": "Echo wrong PLC counter (+1000)",             "duration_s": 3,    "mutate": _scenario_bad_echo_counter},
+    {"name": "STALE_ECHO_CTR", "desc": "Always echo counter 0 (frozen mirror)",      "duration_s": 3,    "mutate": _scenario_stale_echo_counter},
+    {"name": "FAULT_CLEARED",  "desc": "Fault condition gone, awaiting reset",       "duration_s": 2,    "mutate": _scenario_normal},
+    {"name": "RESETTING",      "desc": "Operator pressed reset",                     "duration_s": 1,    "mutate": _scenario_resetting},
+    {"name": "BAD_CRC",        "desc": "Corrupt the packet CRC",                     "duration_s": 3,    "mutate": _scenario_bad_crc},
+    {"name": "FAULT_CLEARED",  "desc": "Fault condition gone, awaiting reset",       "duration_s": 2,    "mutate": _scenario_normal},
+    {"name": "RESETTING",      "desc": "Operator pressed reset",                     "duration_s": 1,    "mutate": _scenario_resetting},
+    {"name": "WDOG_SILENCE",   "desc": "Stop sending packets (watchdog timeout)",    "duration_s": 3,    "mutate": _scenario_watchdog_silence},
+    {"name": "FAULT_CLEARED",  "desc": "Fault condition gone, awaiting reset",       "duration_s": 2,    "mutate": _scenario_normal},
+    {"name": "RESETTING",      "desc": "Operator pressed reset",                     "duration_s": 1,    "mutate": _scenario_resetting},
+    {"name": "LIM_MISMATCH",   "desc": "Report limit switches disagreeing with PLC", "duration_s": 5,    "mutate": _scenario_limit_mismatch},
+    {"name": "FAULT_CLEARED",  "desc": "Fault condition gone, awaiting reset",       "duration_s": 2,    "mutate": _scenario_normal},
+    {"name": "RESETTING",      "desc": "Operator pressed reset",                     "duration_s": 1,    "mutate": _scenario_resetting},
+    {"name": "OVERSPEED",      "desc": "Report motor speed beyond safe envelope",    "duration_s": 5,    "mutate": _scenario_overspeed},
+    {"name": "FAULT_CLEARED",  "desc": "Fault condition gone, awaiting reset",       "duration_s": 2,    "mutate": _scenario_normal},
+    {"name": "RESETTING",      "desc": "Operator pressed reset",                     "duration_s": 1,    "mutate": _scenario_resetting},
+    {"name": "NORMAL_FINAL",   "desc": "Return to healthy — end of test sequence",   "duration_s": None, "mutate": _scenario_normal},
 ]
 
 
@@ -104,7 +107,7 @@ def build_fields(tx_counter, echo_ctr):
     return {
         "counter":          tx_counter,
         "echo_counter":     echo_ctr,
-        "status_bits":      0x02,   # I'm OK
+        "status_bits":      0x00,   # reserved
         "m1_speed":         0,
         "m1_enc":           0,
         "m1_current":       0,
@@ -217,15 +220,14 @@ while True:
     # --------------------
     # Status line
     # --------------------
-    plc_checks_ok  = bool(plc_status_bits & 0x02)
+    plc_ok         = bool(plc_status_bits & 0x02)  # no active faults; in ESTOP = safe to reset
     plc_estop      = not bool(plc_status_bits & 0x01)
     plc_wdog_fault = bool(plc_status_bits & 0x04)
     plc_lim_fault  = bool(plc_status_bits & 0x08)
-    plc_motion     = bool(plc_status_bits & 0x10)
-    plc_fault      = bool(plc_status_bits & 0x20)
+    plc_bad_crc    = bool(plc_status_bits & 0x10)
+    plc_level0     = bool(plc_status_bits & 0x20)
     plc_echo_fault = bool(plc_status_bits & 0x40)
-    plc_motion_fault = bool(plc_status_bits & 0x80)
-
+    plc_motion     = bool(plc_status_bits & 0x80)
 
     if not plc_healthy:
         comm_str = "PLC→RCC:LOST"
@@ -235,11 +237,12 @@ while True:
         comm_str = "OK"
 
     faults = []
+    if plc_wdog_fault: faults.append("WATCHDOG")
+    if plc_bad_crc:    faults.append("BAD_CRC")
     if plc_lim_fault:  faults.append("LIM_MISMATCH")
-    if plc_echo_fault: faults.append("ECHO_CTR_FAULT")
-    if plc_motion:     faults.append("MOTION_POST_ESTOP")
-    if plc_fault:      faults.append("LEVEL0_FAULT")
-    if plc_motion_fault: faults.append("MOTION_FAULT")
+    if plc_echo_fault: faults.append("ECHO_CTR")
+    if plc_level0:     faults.append("LEVEL0")
+    if plc_motion:     faults.append("MOTION")
     fault_str = ",".join(faults) if faults else "none"
 
     sc_elapsed, sc_total = runner.elapsed()
@@ -251,7 +254,7 @@ while True:
         f"  M1={fields['m1_speed']:6d}  lim={fields['tx_limit_sw']:04b}"
         f"  |  "
         f"RX ctr={plc_ctr:5d}  echo={plc_echo_ctr:5d}  comm={comm_str:12s}"
-        f"  checks={'OK' if plc_checks_ok else 'FAIL'}  estop={'Y' if plc_estop else 'N'}"
+        f"  estop={'Y' if plc_estop else 'N'}  {'AWAIT_RESET' if plc_estop and plc_ok else ('OK' if plc_ok else 'FAULT'):11s}"
         f"  faults=[{fault_str}]"
         f"\033[K",
         end='\r', flush=True
