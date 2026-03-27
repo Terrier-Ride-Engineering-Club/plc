@@ -34,6 +34,9 @@
 // Max cycles the RCC's echo of our counter may lag before flagging a fault.
 // At 20ms/cycle this is 100ms — enough to absorb one dropped packet.
 #define ECHO_LAG_LIMIT 5
+// Grace period before a limit switch mismatch escalates to a fault.
+// Allows the RCC time to process a switch transition before disagreeing.
+#define LIMIT_MISMATCH_GRACE_MS 200
 // The speed a motor can be at during an E-Stop before a Cat 0 Stop is thrown
 #define ESTOP_MOTOR_MOVE_THRESHOLD 5
 #define MAX_MOTOR_SPEED 9500  // QPPS; triggers FAULT_MOTION if exceeded
@@ -77,13 +80,14 @@ struct RccPacket {
 };
 
 // -- Global State -------------------------------------------------------------
-static PlcState      plcState          = STATE_OFF;
-static uint16_t      plcCounter        = 0;
-static unsigned long lastValidPacketMs = 0;
-static unsigned long estopAssertedMs   = 0;
-static bool          rccHealthy        = false;
-static bool          badCrcFlag        = false; // Set on CRC failure; cleared on good packet
-static RccPacket     rcc               = {}; // Most recent valid RCC packet
+static PlcState      plcState             = STATE_OFF;
+static uint16_t      plcCounter           = 0;
+static unsigned long lastValidPacketMs    = 0;
+static unsigned long estopAssertedMs      = 0;
+static unsigned long limitMismatchSinceMs = 0; // 0 = no active mismatch
+static bool          rccHealthy           = false;
+static bool          badCrcFlag           = false; // Set on CRC failure; cleared on good packet
+static RccPacket     rcc                  = {}; // Most recent valid RCC packet
 
 // -- CRC16 — ANSI, poly 0x8005 ------------------------------------------------
 static uint16_t crc16(const uint8_t *data, uint16_t len) {
@@ -202,7 +206,7 @@ static bool motorsMoving() {
 // TODO: confirm limit switch bit ordering matches RCC packet offset 66 before re-enabling.
 static uint8_t checkSafetyFaults(uint8_t plcLimits) {
   uint8_t faults = 0;
-  if (plcLimits != rcc.limitSwitches)                                                                                                           faults |= FAULT_LIMIT_MISMATCH;
+  if (limitMismatchSinceMs != 0 && millis() - limitMismatchSinceMs >= LIMIT_MISMATCH_GRACE_MS) faults |= FAULT_LIMIT_MISMATCH;
   int16_t echoLag = (int16_t)((plcCounter - 1) - rcc.echoOfPlc);
   if (echoLag < 0 || echoLag > ECHO_LAG_LIMIT)                                                                                                faults |= FAULT_ECHO_COUNTER;
   if (abs(rcc.m1Speed) > MAX_MOTOR_SPEED || abs(rcc.m2Speed) > MAX_MOTOR_SPEED)                                                                faults |= FAULT_MOTION;
@@ -286,6 +290,13 @@ void loop() {
   uint8_t plcLimits = readLimitSwitches();
   bool    keyOn     = (digitalRead(PIN_KEY_ON)    == HIGH);
   bool    keyMaint  = (digitalRead(PIN_KEY_MAINT) == HIGH);
+
+  // Track how long PLC and RCC limit switch readings have been disagreeing.
+  if (plcLimits != rcc.limitSwitches) {
+    if (limitMismatchSinceMs == 0) limitMismatchSinceMs = now;
+  } else {
+    limitMismatchSinceMs = 0;
+  }
 
   if (now - lastValidPacketMs > WATCHDOG_MS) rccHealthy = false;
 
