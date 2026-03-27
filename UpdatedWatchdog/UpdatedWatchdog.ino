@@ -4,10 +4,10 @@
 #define PIN_RELAY       2   // Power relay, active HIGH
 #define PIN_KEY_ON      3   // ON key switch, HIGH = ON (requires external pulldown)
 #define PIN_KEY_MAINT   4   // MAINT key switch, HIGH = MAINT (requires external pulldown)
-#define PIN_LIM_T1_BOT  6   // Tower 1 bottom limit (NC + INPUT_PULLUP; open wire = triggered)
-#define PIN_LIM_T1_TOP  7   // Tower 1 top limit    (NC + INPUT_PULLUP)
-#define PIN_LIM_T2_BOT  8   // Tower 2 bottom limit (NC + INPUT_PULLUP)
-#define PIN_LIM_T2_TOP  9   // Tower 2 top limit    (NC + INPUT_PULLUP)
+#define PIN_LIM_T1_BOT  6   // Tower 1 bottom limit (NC, 3.3V + INPUT_PULLDOWN; open wire = triggered = LOW)
+#define PIN_LIM_T1_TOP  7   // Tower 1 top limit    (NC, 3.3V + INPUT_PULLDOWN; open wire = triggered = LOW)
+#define PIN_LIM_T2_BOT  8   // Tower 2 bottom limit (NC, 3.3V + INPUT_PULLDOWN; open wire = triggered = LOW)
+#define PIN_LIM_T2_TOP  9   // Tower 2 top limit    (NC, 3.3V + INPUT_PULLDOWN; open wire = triggered = LOW)
 #define PIN_ESTOP       10  // E-stop control, active LOW (LOW = asserted)
 
 // -- Protocol Constants -------------------------------------------------------
@@ -102,12 +102,13 @@ static void setRelay(bool on)       { digitalWrite(PIN_RELAY, on ? HIGH : LOW); 
 static void setEstop(bool asserting) { digitalWrite(PIN_ESTOP, asserting ? LOW : HIGH); }
 
 // Returns limit switch state packed into bits 0–3: T1_BOT, T1_TOP, T2_BOT, T2_TOP
+// NC switches connected to 3.3V with internal pulldown: LOW = triggered (open/floating)
 static uint8_t readLimitSwitches() {
   uint8_t sw = 0;
-  if (digitalRead(PIN_LIM_T1_BOT)) sw |= 0x01;
-  if (digitalRead(PIN_LIM_T1_TOP)) sw |= 0x02;
-  if (digitalRead(PIN_LIM_T2_BOT)) sw |= 0x04;
-  if (digitalRead(PIN_LIM_T2_TOP)) sw |= 0x08;
+  if (!digitalRead(PIN_LIM_T1_BOT)) sw |= 0x01;
+  if (!digitalRead(PIN_LIM_T1_TOP)) sw |= 0x02;
+  if (!digitalRead(PIN_LIM_T2_BOT)) sw |= 0x04;
+  if (!digitalRead(PIN_LIM_T2_TOP)) sw |= 0x08;
   return sw;
 }
 
@@ -245,10 +246,10 @@ void setup() {
   pinMode(LED_BUILTIN,    OUTPUT);
   pinMode(PIN_KEY_ON,     INPUT);
   pinMode(PIN_KEY_MAINT,  INPUT);
-  pinMode(PIN_LIM_T1_BOT, INPUT_PULLUP);
-  pinMode(PIN_LIM_T1_TOP, INPUT_PULLUP);
-  pinMode(PIN_LIM_T2_BOT, INPUT_PULLUP);
-  pinMode(PIN_LIM_T2_TOP, INPUT_PULLUP);
+  pinMode(PIN_LIM_T1_BOT, INPUT_PULLDOWN);
+  pinMode(PIN_LIM_T1_TOP, INPUT_PULLDOWN);
+  pinMode(PIN_LIM_T2_BOT, INPUT_PULLDOWN);
+  pinMode(PIN_LIM_T2_TOP, INPUT_PULLDOWN);
 
   setRelay(false);  // Everything off at boot
   setEstop(true);   // E-stop asserted until system is ready
