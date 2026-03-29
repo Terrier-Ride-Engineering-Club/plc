@@ -248,8 +248,8 @@ void setup() {
   pinMode(PIN_RELAY,      OUTPUT);
   pinMode(PIN_ESTOP,      OUTPUT);
   pinMode(LED_BUILTIN,    OUTPUT);
-  pinMode(PIN_KEY_ON,     INPUT);
-  pinMode(PIN_KEY_MAINT,  INPUT);
+  pinMode(PIN_KEY_ON,     INPUT_PULLDOWN);
+  pinMode(PIN_KEY_MAINT,  INPUT_PULLDOWN);
   pinMode(PIN_LIM_T1_BOT, INPUT_PULLDOWN);
   pinMode(PIN_LIM_T1_TOP, INPUT_PULLDOWN);
   pinMode(PIN_LIM_T2_BOT, INPUT_PULLDOWN);
@@ -312,6 +312,7 @@ void loop() {
 
     case STATE_STARTING:
       // Relay on, E-stop held until RCC establishes a healthy watchdog link.
+      setRelay(true);
       setEstop(true);
       if (!keyOn)     { plcState = STATE_OFF; break; }
       if (rccHealthy) { plcState = STATE_OK;  }
