@@ -40,6 +40,8 @@
 // The speed a motor can be at during an E-Stop before a Cat 0 Stop is thrown
 #define ESTOP_MOTOR_MOVE_THRESHOLD 5
 #define MAX_MOTOR_SPEED 9500  // QPPS; triggers FAULT_MOTION if exceeded
+// Grace period from key turning to OFF before relay power is cut.
+#define POWEROFF_DELAY_MS 3000
 
 
 // -- PLC State Machine --------------------------------------------------------
@@ -84,6 +86,7 @@ static PlcState      plcState             = STATE_OFF;
 static uint16_t      plcCounter           = 0;
 static unsigned long lastValidPacketMs    = 0;
 static unsigned long estopAssertedMs      = 0;
+static unsigned long keyOffSinceMs        = 0; // 0 = key not in OFF position
 static unsigned long limitMismatchSinceMs = 0; // 0 = no active mismatch
 static bool          rccHealthy           = false;
 static bool          badCrcFlag           = false; // Set on CRC failure; cleared on good packet
@@ -300,6 +303,15 @@ void loop() {
 
   if (now - lastValidPacketMs > WATCHDOG_MS) rccHealthy = false;
 
+  // Track how long the key has been in the OFF position.
+  // Relay is only cut after POWEROFF_DELAY_MS; turning key back on cancels the timer.
+  if (keyOn || keyMaint) {
+    keyOffSinceMs = 0;
+  } else if (keyOffSinceMs == 0) {
+    keyOffSinceMs = now;
+  }
+  bool powerOffReady = (keyOffSinceMs != 0 && now - keyOffSinceMs >= POWEROFF_DELAY_MS);
+
   // -- State machine --
   switch (plcState) {
 
@@ -314,19 +326,19 @@ void loop() {
       // Relay on, E-stop held until RCC establishes a healthy watchdog link.
       setRelay(true);
       setEstop(true);
-      if (!keyOn)     { plcState = STATE_OFF; break; }
-      if (rccHealthy) { plcState = STATE_OK;  }
+      if (!keyOn && powerOffReady) { plcState = STATE_OFF; break; }
+      if (rccHealthy)              { plcState = STATE_OK;  }
       break;
 
     case STATE_OK:
-      if (!keyOn) { plcState = STATE_OFF; break; }
+      if (!keyOn && powerOffReady)                         { plcState = STATE_OFF; break; }
       if (!rccHealthy || safetyViolation(plcLimits)) { enterEstop(now); break; }
       setEstop(false);  // All checks pass — open PLC E-stop gate
       break;
 
     case STATE_ESTOP:
       setEstop(true);
-      if (!keyOn && !keyMaint) { plcState = STATE_OFF; break; }
+      if (!keyOn && !keyMaint && powerOffReady) { plcState = STATE_OFF; break; }
       // Level 0: motors still moving after deceleration window → cut power
       if (motorsMoving() && (now - estopAssertedMs > MOTION_STOP_TIMEOUT_MS)) {
         plcState = STATE_FAULT;
@@ -347,7 +359,7 @@ void loop() {
       break;
 
     case STATE_MAINT:
-      if (!keyMaint) { setEstop(true); plcState = STATE_OFF; break; }
+      if (!keyMaint && powerOffReady) { setEstop(true); plcState = STATE_OFF; break; }
       if (!rccHealthy || safetyViolation(plcLimits)) { enterEstop(now); break; }
       setEstop(false);
       break;
